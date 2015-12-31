@@ -1,0 +1,962 @@
+---
+  class: "Workflow"
+  @context: "https://raw.githubusercontent.com/common-workflow-language/common-workflow-language/draft2/specification/context.json"
+  steps: 
+    - 
+      id: "#Muse"
+      run: 
+        class: "CommandLineTool"
+        stdin: ""
+        requirements: 
+          - 
+            class: "DockerRequirement"
+            dockerPull: "images.sbgenomics.com/sinisa/muse:v1"
+            dockerImageId: ""
+          - 
+            class: "CPURequirement"
+            value: 32
+          - 
+            class: "MemRequirement"
+            value: 60000
+          - 
+            requirements: 
+              - 
+                class: "DockerRequirement"
+                dockerPull: "rabix/js-engine"
+            id: "#cwl-js-engine"
+            class: "ExpressionEngineRequirement"
+          - 
+            fileDef: 
+              - 
+                filename: "muse.py"
+                fileContent: "#!/usr/bin/env python\n\nimport sys\nimport re\nimport os\nimport string\nimport shutil\nimport logging\nimport subprocess\nimport tempfile\nfrom multiprocessing import Pool\nfrom argparse import ArgumentParser\n\ndef which(cmd):\n    cmd = [\"which\",cmd]\n    p = subprocess.Popen(cmd, stdout=subprocess.PIPE)\n    res = p.stdout.readline().rstrip()\n    if len(res) == 0: return None\n    return res\n\ndef fai_chunk(path, blocksize):\n    seq_map = {}\n    with open( path ) as handle:\n        for line in handle:\n            tmp = line.split(\"\\t\")\n            seq_map[tmp[0]] = long(tmp[1])\n\n    for seq in seq_map:\n        l = seq_map[seq]\n        for i in xrange(1, l, blocksize):\n            yield (seq, i, min(i+blocksize-1, l))\n\ndef cmd_caller(cmd):\n    logging.info(\"RUNNING: %s\" % (cmd))\n    print \"running\", cmd\n    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)\n    stdout, stderr = p.communicate()\n    if len(stderr):\n        print stderr\n    return p.returncode\n\ndef cmds_runner(cmds, cpus):\n    p = Pool(cpus)\n    values = p.map(cmd_caller, cmds, 1)\n    return values\n\ndef call_cmd_iter(muse, ref_seq, block_size, tumor_bam, normal_bam, contamination, output_base):\n    contamination_str = \"\"\n    if contamination is not None:\n        contamination_str = \"-p %s\" % (contamination)\n    template = string.Template(\"${MUSE} call -f ${REF_SEQ} ${CONTAMINATION} -r ${INTERVAL} ${TUMOR_BAM} ${NORMAL_BAM} -O ${OUTPUT_BASE}.${BLOCK_NUM}\")\n    for i, block in enumerate(fai_chunk( ref_seq + \".fai\", block_size ) ):\n            cmd = template.substitute(\n                dict(\n                    REF_SEQ=ref_seq,\n                    CONTAMINATION=contamination_str,\n                    BLOCK_NUM=i,\n                    INTERVAL=\"%s:%s-%s\" % (block[0], block[1], block[2]) ),\n                    MUSE=muse,\n                    TUMOR_BAM=tumor_bam,\n                    NORMAL_BAM=normal_bam,\n                    OUTPUT_BASE=output_base\n            )\n            yield cmd, \"%s.%s.MuSE.txt\" % (output_base, i)\n\ndef run_muse(args):\n\n    mode_flag = \"\"\n    if args.muse.endswith(\"MuSEv1.0rc\"):\n        args.p = None\n        if args.mode == \"wgs\":\n            mode_flag = \"-G\"\n        else:\n            mode_flag = \"-E\"\n\n    if not os.path.exists(args.muse):\n        args.muse = which(args.muse)\n\n    workdir = os.path.abspath(tempfile.mkdtemp(dir=args.workdir, prefix=\"muse_work_\"))\n\n    if not os.path.exists(args.f + \".fai\"):\n        logging.debug(\"Didn't find .fai\")\n        new_ref = os.path.join(workdir, \"ref_genome.fasta\")\n        os.symlink(os.path.abspath(args.f),new_ref)\n        subprocess.check_call( [\"/usr/bin/samtools\", \"faidx\", new_ref] )\n        args.f = new_ref\n\n    if args.normal_bam_index is None:\n        if not os.path.exists(args.normal_bam + \".bai\"):\n            # new_bam = os.path.join(os.path.abspath(workdir), \"normal.bam\")\n            new_bam = \"normal.bam\"\n            logging.error(\"bam path %s %s\", os.path.abspath(args.normal_bam), new_bam)\n            os.symlink(os.path.abspath(args.normal_bam),new_bam)\n            subprocess.check_call( [\"/usr/bin/samtools\", \"index\", new_bam] )\n            args.normal_bam = new_bam\n    else:\n        new_bam = os.path.join(os.path.abspath(workdir), \"normal.bam\")\n        os.symlink(os.path.abspath(args.normal_bam), new_bam)\n        os.symlink(os.path.abspath(args.normal_bam_index), new_bam + \".bai\")\n        args.normal_bam = new_bam\n\n    if args.tumor_bam_index is None:\n        if not os.path.exists(args.tumor_bam + \".bai\"):\n            # new_bam = os.path.join(os.path.abspath(workdir), \"tumor.bam\")\n            new_bam = \"tumor.bam\"\n            os.symlink(os.path.abspath(args.tumor_bam),new_bam)\n            subprocess.check_call( [\"/usr/bin/samtools\", \"index\", new_bam] )\n            args.tumor_bam = new_bam\n    else:\n        new_bam = os.path.join(workdir, \"tumor.bam\")\n        os.symlink(os.path.abspath(args.tumor_bam), new_bam)\n        os.symlink(os.path.abspath(args.tumor_bam_index), new_bam + \".bai\")\n        args.tumor_bam = new_bam\n\n    cmds = list(call_cmd_iter(ref_seq=args.f,\n        muse=args.muse,\n        block_size=args.b,\n        tumor_bam=args.tumor_bam,\n        normal_bam=args.normal_bam,\n        contamination=args.p,\n        output_base=os.path.join(workdir, \"output.file\"))\n    )\n\n    rvals = cmds_runner(list(a[0] for a in cmds), args.cpus)\n    if any(rvals):\n        raise Exception(\"MuSE CALL failed\")\n    #check if rvals is ok\n    first = True\n    merge = os.path.join(workdir, \"merge.output\")\n    with open(merge, \"w\") as ohandle:\n        for cmd, out in cmds:\n            with open(out) as handle:\n                for line in handle:\n                    if first or not line.startswith(\"#\"):\n                        ohandle.write(line)\n            first = False\n            if not args.no_clean:\n                os.unlink(out)\n\n    dbsnp_file = None\n    if args.D:\n        new_dbsnp = os.path.join(workdir, \"db_snp.vcf\")\n        os.symlink(args.D,new_dbsnp)\n        subprocess.check_call( [\"/usr/bin/bgzip\", new_dbsnp] )\n        subprocess.check_call( [\"/usr/bin/tabix\", \"-p\", \"vcf\", new_dbsnp + \".gz\" ])\n        dbsnp_file = new_dbsnp + \".gz\"\n        sump_template = string.Template(\"${MUSE} sump -I ${MERGE} -O ${OUTPUT} -D ${DBSNP} ${MODE}\")\n    else:\n        sump_template = string.Template(\"${MUSE} sump -I ${MERGE} -O ${OUTPUT} ${MODE}\")\n\n    tmp_out = os.path.join(workdir, \"tmp.vcf\")\n    sump_cmd = sump_template.substitute( dict (\n        MUSE=args.muse,\n        MERGE=merge,\n        OUTPUT=tmp_out,\n        DBSNP=dbsnp_file,\n        MODE=mode_flag\n    ))\n    cmd_caller(sump_cmd)\n\n    if args.muse.endswith(\"MuSEv0.9.9.5\"):\n        subprocess.check_call( [\"/opt/bin/vcf_reformat.py\", tmp_out, \"-o\", args.O,\n            \"-b\", \"TUMOR\", args.tumor_bam, \"-b\", \"NORMAL\", args.normal_bam] )\n    else:\n        shutil.copy(tmp_out, args.O)\n\n    if not args.no_clean:\n        shutil.rmtree(workdir)\n\n\nif __name__ == \"__main__\":\n    parser = ArgumentParser()\n    parser.add_argument(\"-m\", \"--muse\", help=\"Which Copy of MuSE\", choices=[\"MuSEv0.9.9.5\", \"MuSEv1.0rc\"], default=\"MuSEv0.9.9.5\")\n    parser.add_argument(\"-f\", help=\"faidx indexed reference sequence file\", required=True)\n    #parser.add_argument(\"-r\", help=\"single region (chr:pos-pos) where somatic mutations are called\")\n    #parser.add_argument(\"-l\", help=\"list of regions (chr:pos-pos or BED), one region per line\")\n    parser.add_argument(\"-p\", type=float, help=\"normal data contamination rate [0.050]\", default=0.05)\n    parser.add_argument(\"-b\", type=long, help=\"Parallel Block Size\", default=50000000)\n    parser.add_argument(\"-O\", help=\"output file name (VCF)\", default=\"out.vcf\")\n    parser.add_argument(\"-D\", help=\"\"\"dbSNP vcf file that should be bgzip compressed,\ntabix indexed and based on the same reference\ngenome used in 'MuSE call'\"\"\")\n\n    parser.add_argument(\"-n\", \"--cpus\", type=int, default=8)\n    parser.add_argument(\"-w\", \"--workdir\", default=\"/tmp\")\n    parser.add_argument(\"--no-clean\", action=\"store_true\", default=False)\n    parser.add_argument(\"--mode\", choices=[\"wgs\", \"wxs\"], default=\"wgs\")\n    parser.add_argument(\"--tumor-bam\", dest=\"tumor_bam\", required=True)\n    parser.add_argument(\"--tumor-bam-index\", dest=\"tumor_bam_index\", default=None)\n    parser.add_argument(\"--normal-bam\", dest=\"normal_bam\", required=True)\n    parser.add_argument(\"--normal-bam-index\", dest=\"normal_bam_index\", default=None)\n    args = parser.parse_args()\n    run_muse(args)"
+            class: "CreateFileRequirement"
+        description: ""
+        @context: "https://github.com/common-workflow-language/common-workflow-language/blob/draft-1/specification/tool-description.md"
+        baseCommand: 
+          - "python"
+          - "muse.py"
+          - "-O"
+          - 
+            script: "$job.inputs.normal.path.split('/').slice(-1)[0].split('.').slice(0, -1).join('.') + '.muse.vcf'"
+            engine: "#cwl-js-engine"
+            class: "Expression"
+          - "-w"
+          - "./"
+          - "--muse"
+          - "MuSEv1.0rc"
+        hints: []
+        id: "https://brood.sbgenomics.com/v1/apps/sinisa/pcawg-tools/muse/6/"
+        arguments: 
+          - 
+            separate: true
+            valueFrom: "32"
+            prefix: "-n"
+        stdout: ""
+        label: "Muse"
+        inputs: 
+          - 
+            id: "#input_normal_bai"
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#input_tumor_bai"
+            type: 
+              - "null"
+              - "File"
+          - 
+            label: ""
+            inputBinding: 
+              separate: true
+              prefix: "--tumor-bam"
+            type: 
+              - "null"
+              - "File"
+            id: "#tumor"
+          - 
+            label: "Normal BAM"
+            inputBinding: 
+              separate: true
+              prefix: "--normal-bam"
+            type: 
+              - "null"
+              - "File"
+            id: "#normal"
+          - 
+            label: "Reference"
+            inputBinding: 
+              separate: true
+              prefix: "-f"
+            type: 
+              - "null"
+              - "File"
+            id: "#reference"
+          - 
+            label: "know"
+            inputBinding: 
+              separate: true
+              prefix: "-D"
+            type: 
+              - "null"
+              - "File"
+            id: "#know"
+          - 
+            label: "mode"
+            inputBinding: 
+              separate: true
+              prefix: "--mode"
+            type: 
+              - "null"
+              - 
+                symbols: 
+                  - "wgs"
+                  - "wxs"
+                name: "mode"
+                type: "enum"
+            id: "#mode"
+          - 
+            label: "No clean"
+            id: "#no_clean"
+            description: "Don't remove workdir files"
+            inputBinding: 
+              separate: true
+              prefix: "--no-clean"
+            type: 
+              - "null"
+              - "boolean"
+        outputs: 
+          - 
+            id: "#mutations"
+            outputBinding: 
+              glob: "*.muse.vcf"
+              metadata: 
+                file_type: "vcf"
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#normal_bai"
+            outputBinding: 
+              glob: "normal.bam.bai"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#tumor_bai"
+            outputBinding: 
+              glob: "tumor.bam.bai"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+      inputs: 
+        - 
+          id: "#Muse.input_normal_bai"
+        - 
+          id: "#Muse.input_tumor_bai"
+        - 
+          id: "#Muse.tumor"
+        - 
+          id: "#Muse.normal"
+        - 
+          id: "#Muse.reference"
+        - 
+          id: "#Muse.know"
+        - 
+          id: "#Muse.mode"
+          default: "wgs"
+        - 
+          id: "#Muse.no_clean"
+      outputs: 
+        - 
+          id: "#Muse.mutations"
+        - 
+          id: "#Muse.normal_bai"
+        - 
+          id: "#Muse.tumor_bai"
+    - 
+      id: "#broad_variant_pipeline"
+      run: 
+        class: "CommandLineTool"
+        stdin: ""
+        requirements: 
+          - 
+            class: "DockerRequirement"
+            dockerPull: "private-images.sbgenomics.com/sinisa/broad_variant_pipeline:v10"
+            dockerImageId: ""
+          - 
+            class: "CPURequirement"
+            value: 32
+          - 
+            class: "MemRequirement"
+            value: 55000
+          - 
+            requirements: 
+              - 
+                class: "DockerRequirement"
+                dockerPull: "rabix/js-engine"
+            id: "#cwl-js-engine"
+            class: "ExpressionEngineRequirement"
+          - 
+            fileDef: 
+              - 
+                filename: "broad_variant_pipeline.sh"
+                fileContent: "#!/bin/bash\nexport INDIVIDUAL_ID=$1\nexport BAM_TUMOR=$2\nexport BAM_TUMOR_BAI=$3\nexport BAM_NORMAL=$4\nexport BAM_NORMAL_BAI=$5\n# export REF_DIR=$6\nREF_FILE=$6\n#export FINALRESULTSDIR=`readlink -f $7`\nexport FINALRESULTSDIR=`pwd`\n\ntar --directory /tmp -xzf $REF_FILE\nexport REF_DIR=/tmp/refdata\n\nln -s $BAM_TUMOR tumor.bam\nln -s $BAM_TUMOR_BAI tumor.bam.bai\nln -s $BAM_NORMAL normal.bam\nln -s $BAM_NORMAL_BAI normal.bam.bai\n\nln -s $REF_DIR /cga/fh/pcawg_pipeline/refdata\n\nPIPELINE=/cga/fh/pcawg_pipeline/pipelines/pcawg_pipeline_v5.py\n\nexport PIPETTE_SERVER_DIR=/cga/fh/pcawg_pipeline/utils/pipette_server\n\nexport COMMDIR=$FINALRESULTSDIR/jobResults_pipette/status\n#OUTDIR contains the intermediate files\nexport OUTDIR=$FINALRESULTSDIR/jobResults_pipette/jobs/$INDIVIDUAL_ID\n#FINALRESULTSDIR contains all the files that should be kept after the pipeline completes\n#export FINALRESULTSDIR=/cga/fh/pcawg_pipeline/jobResults_pipette/results\n\nrm -rf $COMMDIR\nmkdir -p $COMMDIR\n\nset -e\n\npython3 $PIPETTE_SERVER_DIR/pipetteSynchronousRunner.py $COMMDIR $OUTDIR $PIPELINE $COMMDIR $OUTDIR $INDIVIDUAL_ID `pwd`/tumor.bam `pwd`/normal.bam # > run.out 2> run.err\n\nfind $OUTDIR -name pipette.module.usage.txt  | xargs  sh -c 'for f; do cat \"$f\" ; done' true |sort | uniq > $FINALRESULTSDIR/summary.usage.txt\n\nmkdir $FINALRESULTSDIR/gnos_vcfs\n#cp $OUTDIR/links_for_gnos/*/*.vcf.gz $FINALRESULTSDIR/gnos_vcfs/\n\n# ignore potential fails of first two CPs\nset +e\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_dRanger/*.broad-dRanger.DATECODE.somatic.sv.vcf.gz ${INDIVIDUAL_ID}.broad-dRanger.DATECODE.somatic.sv.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_dRanger/*.broad-dRanger.DATECODE.somatic.sv.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-dRanger.DATECODE.somatic.sv.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_merge_sv_vcf/*.broad-dRanger_snowman.DATECODE.somatic.sv.vcf.gz ${INDIVIDUAL_ID}.broad-dRanger_snowman.DATECODE.somatic.sv.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_merge_sv_vcf/*.broad-dRanger_snowman.DATECODE.somatic.sv.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-dRanger_snowman.DATECODE.somatic.sv.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_mutect/*.broad-mutect.DATECODE.somatic.snv_mnv.vcf.gz ${INDIVIDUAL_ID}.broad-mutect.DATECODE.somatic.snv_mnv.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_mutect/*.broad-mutect.DATECODE.somatic.snv_mnv.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-mutect.DATECODE.somatic.snv_mnv.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_germline_indel/*.broad-snowman.DATECODE.germline.indel.vcf.gz ${INDIVIDUAL_ID}.broad-snowman.DATECODE.germline.indel.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_germline_indel/*.broad-snowman.DATECODE.germline.indel.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-snowman.DATECODE.germline.indel.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_germline_sv/*.broad-snowman.DATECODE.germline.sv.vcf.gz ${INDIVIDUAL_ID}.broad-snowman.DATECODE.germline.sv.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_germline_sv/*.broad-snowman.DATECODE.germline.sv.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-snowman.DATECODE.germline.sv.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_somatic_indel/*.broad-snowman.DATECODE.somatic.indel.vcf.gz ${INDIVIDUAL_ID}.broad-snowman.DATECODE.somatic.indel.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_somatic_indel/*.broad-snowman.DATECODE.somatic.indel.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-snowman.DATECODE.somatic.indel.vcf.gz.tbi\n\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_somatic_sv/*.broad-snowman.DATECODE.somatic.sv.vcf.gz ${INDIVIDUAL_ID}.broad-snowman.DATECODE.somatic.sv.vcf.gz\ncp $FINALRESULTSDIR/jobResults_pipette/jobs/*/links_for_gnos/tabix_snowman_somatic_sv/*.broad-snowman.DATECODE.somatic.sv.vcf.gz.tbi ${INDIVIDUAL_ID}.broad-snowman.DATECODE.somatic.sv.vcf.gz.tbi\n\n# fails are fatal again\nset -e\n\n#collect the file outputs for return back to Broad\ntar -cvhf $FINALRESULTSDIR/${INDIVIDUAL_ID}.broad.tar.gz $OUTDIR/links_for_broad\n\n# Collect logs\nzip -R ${INDIVIDUAL_ID}.logs.zip '*stdout*' '*stderr*'\n\n#display any failing modules\ncat summary.usage.txt"
+            class: "CreateFileRequirement"
+        description: "Now with added log capture and filename prefixes."
+        @context: "https://github.com/common-workflow-language/common-workflow-language/blob/draft-1/specification/tool-description.md"
+        baseCommand: 
+          - "bash"
+          - "broad_variant_pipeline.sh"
+        hints: []
+        id: "https://brood.sbgenomics.com/v1/apps/sinisa/pcawg-tools/broad-variant-pipeline/20/"
+        arguments: []
+        stdout: 
+          script: "{\n  id = $job.inputs.individual_id || ($job.inputs.normal.metadata || {}).sample;\n  return id + \".stdout.log\";\n}"
+          engine: "#cwl-js-engine"
+          class: "Expression"
+        label: "broad-variant-pipeline"
+        inputs: 
+          - 
+            id: "#tumor"
+            inputBinding: 
+              position: 2
+              secondaryFiles: 
+                - ".bai"
+              separate: true
+            type: 
+              - "File"
+          - 
+            id: "#normal"
+            inputBinding: 
+              position: 4
+              secondaryFiles: 
+                - ".bai"
+              separate: true
+            type: 
+              - "File"
+          - 
+            label: "Reference"
+            id: "#ref_tarball"
+            inputBinding: 
+              position: 6
+              separate: true
+            type: 
+              - "File"
+          - 
+            id: "#individual_id"
+            inputBinding: 
+              position: 1
+              separate: true
+              valueFrom: 
+                script: "$job.inputs.individual_id || $job.inputs.tumor.metadata.aliquotID || $job.inputs.normal.metadata.sample || \"unknown_id\""
+                engine: "#cwl-js-engine"
+                class: "Expression"
+            type: 
+              - "null"
+              - "string"
+          - 
+            id: "#tumor_bai"
+            inputBinding: 
+              position: 3
+              separate: true
+              valueFrom: 
+                script: "$job.inputs.tumor_bai?$job.inputs.tumor_bai.path:$job.inputs.tumor.path+\".bai\""
+                engine: "#cwl-js-engine"
+                class: "Expression"
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#normal_bai"
+            inputBinding: 
+              position: 5
+              separate: true
+              valueFrom: 
+                script: "$job.inputs.normal_bai?$job.inputs.normal_bai.path:$job.inputs.normal.path+\".bai\""
+                engine: "#cwl-js-engine"
+                class: "Expression"
+            type: 
+              - "null"
+              - "File"
+        outputs: 
+          - 
+            id: "#vcfs"
+            outputBinding: 
+              glob: "*.vcf.gz"
+              metadata: 
+                file_type: "vcf"
+                sample: 
+                  script: "$job.inputs.individual_id || ($job.inputs.normal.metadata || {}).sample"
+                  engine: "#cwl-js-engine"
+                  class: "Expression"
+            type: 
+              - 
+                items: "File"
+                type: "array"
+          - 
+            id: "#broadlinks"
+            outputBinding: 
+              glob: "*.broad.tar.gz"
+              metadata: 
+                file_type: "archive"
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#stdout"
+            outputBinding: 
+              glob: "*.stdout.log"
+              metadata: 
+                file_type: "text"
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#logs"
+            outputBinding: 
+              glob: "*.logs.zip"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+          - 
+            label: "tbis"
+            id: "#tbis"
+            outputBinding: 
+              glob: "*.tbi"
+              metadata: {}
+            type: 
+              - "null"
+              - 
+                items: "File"
+                type: "array"
+      inputs: 
+        - 
+          id: "#broad_variant_pipeline.tumor"
+        - 
+          id: "#broad_variant_pipeline.normal"
+        - 
+          id: "#broad_variant_pipeline.ref_tarball"
+        - 
+          id: "#broad_variant_pipeline.individual_id"
+        - 
+          id: "#broad_variant_pipeline.tumor_bai"
+        - 
+          id: "#broad_variant_pipeline.normal_bai"
+        - 
+          id: "#broad_variant_pipeline.dummy_port"
+      outputs: 
+        - 
+          id: "#broad_variant_pipeline.vcfs"
+        - 
+          id: "#broad_variant_pipeline.broadlinks"
+        - 
+          id: "#broad_variant_pipeline.stdout"
+        - 
+          id: "#broad_variant_pipeline.logs"
+        - 
+          id: "#broad_variant_pipeline.tbis"
+    - 
+      id: "#remap_broad_tar"
+      run: 
+        class: "CommandLineTool"
+        @context: "https://github.com/common-workflow-language/common-workflow-language/blob/draft-1/specification/tool-description.md"
+        requirements: 
+          - 
+            class: "DockerRequirement"
+            dockerPull: "images.sbgenomics.com/sinisa/remap_broad_tar:latest"
+            dockerImageId: ""
+          - 
+            class: "CPURequirement"
+            value: 1
+          - 
+            class: "MemRequirement"
+            value: 1000
+          - 
+            requirements: 
+              - 
+                class: "DockerRequirement"
+                dockerPull: "rabix/js-engine"
+            id: "#cwl-js-engine"
+            class: "ExpressionEngineRequirement"
+        description: ""
+        baseCommand: 
+          - "/opt/remap_broad_tar.py"
+        hints: []
+        id: "https://brood.sbgenomics.com/v1/apps/milena/pcawg-muse-test/remap-broad-tar/3/"
+        arguments: 
+          - 
+            position: 2
+            separate: true
+            valueFrom: "./"
+        stdout: ""
+        label: "remap-broad-tar"
+        stdin: ""
+        inputs: 
+          - 
+            id: "#broad_input_tar"
+            inputBinding: 
+              position: 1
+              separate: true
+            type: 
+              - "File"
+          - 
+            id: "#rename"
+            inputBinding: 
+              separate: true
+              position: 0
+              itemSeparator: " "
+              prefix: "--rename"
+            type: 
+              - "null"
+              - 
+                items: "string"
+                type: "array"
+          - 
+            id: "#SampleId"
+            inputBinding: 
+              position: 3
+              separate: true
+              valueFrom: 
+                script: "$job.inputs.SampleId || $job.inputs.tumor_bam.metadata.aliquotID "
+                engine: "#cwl-js-engine"
+                class: "Expression"
+            type: 
+              - "null"
+              - "string"
+          - 
+            id: "#tumor_bam"
+            type: 
+              - "null"
+              - "File"
+        outputs: 
+          - 
+            id: "#md5"
+            outputBinding: 
+              glob: "*.tar.md5"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+          - 
+            id: "#output"
+            outputBinding: 
+              glob: "*.tar"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+      inputs: 
+        - 
+          id: "#remap_broad_tar.broad_input_tar"
+        - 
+          id: "#remap_broad_tar.rename"
+        - 
+          id: "#remap_broad_tar.SampleId"
+        - 
+          id: "#remap_broad_tar.tumor_bam"
+      outputs: 
+        - 
+          id: "#remap_broad_tar.md5"
+        - 
+          id: "#remap_broad_tar.output"
+    - 
+      id: "#tabix_indexer"
+      run: 
+        class: "CommandLineTool"
+        stdin: ""
+        description: "Tabix indexes a TAB-delimited genome position file in.tab.bgz and creates an index file in.tab.bgz.tbi when region is absent from the command-line. The input data file must be position sorted and compressed by bgzip which has a gzip(1) like interface. After indexing, tabix is able to quickly retrieve data lines overlapping regions specified in the format \"chr:beginPos-endPos\". Fast data retrieval also works over network if URI is given as a file name and in this case the index file will be downloaded if it is not present locally."
+        @context: "https://github.com/common-workflow-language/common-workflow-language/blob/draft-2/specification/tool-description.md"
+        name: "tabix"
+        baseCommand: 
+          - "/opt/tabix-0.2.6/bgzip"
+        hints: []
+        id: "https://brood.sbgenomics.com/v1/apps/ljuba/pcawg-2nd-round-processing-91-donors/tabix-indexer/1/"
+        arguments: 
+          - 
+            separate: true
+            order: 0
+            valueFrom: "-f"
+            prefix: ""
+          - 
+            separate: true
+            valueFrom: "-c"
+        stdout: 
+          script: "$job.inputs.input_file.path.replace(/^.*[\\\\\\/]/, '') + \".gz\""
+          engine: "#cwl-js-engine"
+          class: "Expression"
+        label: "tabix_indexer"
+        inputs: 
+          - 
+            label: "Input file"
+            inputBinding: 
+              position: 99
+              separate: true
+            type: 
+              - "File"
+            id: "#input_file"
+            description: "Input file for tabix indexing."
+          - 
+            label: "Reserve N MB of RAM."
+            id: "#mem_mb"
+            description: "Reserve N MB of RAM for tool execution."
+            type: 
+              - "null"
+              - "int"
+        adapters: []
+        requirements: 
+          - 
+            class: "DockerRequirement"
+            dockerPull: "images.sbgenomics.com/djordje_klisic/tabix:0.2.6"
+            dockerImageId: "78fc60e5f28a"
+          - 
+            class: "CPURequirement"
+            value: 1
+          - 
+            class: "MemRequirement"
+            value: 
+              script: "{\n  if ($job.inputs.mem_mb)\n  {\n    return $job.inputs.mem_mb\n  }\n  else\n  {\n    return 2048\n  }\n}"
+              engine: "#cwl-js-engine"
+              class: "Expression"
+          - 
+            requirements: 
+              - 
+                class: "DockerRequirement"
+                dockerPull: "rabix/js-engine"
+            id: "#cwl-js-engine"
+            class: "ExpressionEngineRequirement"
+            engineCommand: "cwl-engine.js"
+        outputs: 
+          - 
+            label: "BGZIP-ed file"
+            outputBinding: 
+              glob: "*.vcf.gz"
+              metadata: 
+                __inherit__: "input_file"
+            type: 
+              - "null"
+              - "File"
+            id: "#indexed_file"
+            description: "BGZIP-ed file."
+      inputs: 
+        - 
+          id: "#tabix_indexer.input_file"
+        - 
+          id: "#tabix_indexer.mem_mb"
+          default: 4096
+      outputs: 
+        - 
+          id: "#tabix_indexer.indexed_file"
+    - 
+      id: "#tabix_index"
+      run: 
+        class: "CommandLineTool"
+        stdin: ""
+        description: "Tabix indexes a TAB-delimited genome position file in.tab.bgz and creates an index file in.tab.bgz.tbi when region is absent from the command-line. The input data file must be position sorted and compressed by bgzip which has a gzip(1) like interface. After indexing, tabix is able to quickly retrieve data lines overlapping regions specified in the format \"chr:beginPos-endPos\". Fast data retrieval also works over network if URI is given as a file name and in this case the index file will be downloaded if it is not present locally."
+        contributor: []
+        @context: "https://github.com/common-workflow-language/common-workflow-language/blob/draft-2/specification/tool-description.md"
+        name: "tabix"
+        baseCommand: 
+          - "/opt/tabix-0.2.6/tabix"
+        hints: []
+        id: "https://brood.sbgenomics.com/v1/apps/ljuba/pcawg-2nd-round-processing-91-donors/tabix-index-1/1/"
+        arguments: 
+          - 
+            separate: true
+            order: 0
+            valueFrom: "-f"
+            prefix: ""
+        stdout: ""
+        label: "tabix index"
+        inputs: 
+          - 
+            label: "Select input file format"
+            inputBinding: 
+              position: 1
+              separate: true
+              prefix: "-p"
+            type: 
+              - 
+                symbols: 
+                  - "gff"
+                  - "bed"
+                  - "sam"
+                  - "vcf"
+                  - "psltab"
+                name: "type_format"
+                type: "enum"
+            id: "#type_format"
+            description: "Select input file format"
+          - 
+            label: "Skip first N lines"
+            inputBinding: 
+              position: 5
+              separate: true
+              prefix: "-S"
+            type: 
+              - "null"
+              - "int"
+            id: "#skip_lines"
+            description: "Skip first N lines in the data file."
+          - 
+            label: "End position of the chromosome column"
+            inputBinding: 
+              position: 4
+              separate: true
+              prefix: "-e"
+            type: 
+              - "null"
+              - "int"
+            id: "#end_chr"
+            description: "End position of the chromosome column. Can be identical to start chromosome column."
+          - 
+            label: "Column of the sequence name"
+            inputBinding: 
+              position: 2
+              separate: true
+              prefix: "-s"
+            type: 
+              - "null"
+              - "int"
+            id: "#sequence_name_col"
+            description: "Column of the sequence name."
+          - 
+            label: "Input file"
+            inputBinding: 
+              position: 99
+              separate: true
+            type: 
+              - "File"
+            id: "#input_file"
+            description: "Input file for tabix indexing."
+          - 
+            label: "Start position of the chromosome column"
+            inputBinding: 
+              position: 3
+              separate: true
+              prefix: "-b"
+            type: 
+              - "null"
+              - "int"
+            id: "#chr_start"
+            description: "Start position of the chromosome column"
+          - 
+            label: "Skip lines starting with character CHAR"
+            inputBinding: 
+              position: 6
+              separate: true
+              prefix: "-c"
+            type: 
+              - "null"
+              - "string"
+            id: "#comment_lines"
+            description: "Skip lines starting with character CHAR."
+          - 
+            label: "Specify if the position in the data file is 0 based"
+            inputBinding: 
+              position: 7
+              separate: true
+              prefix: "-0"
+            type: 
+              - "null"
+              - "boolean"
+            id: "#zero_based"
+            description: "Specify if the position in the data file is 0 based."
+          - 
+            label: "Region1 is a BED file"
+            id: "#region_bed"
+            description: "Region1 is a BED file (entire file will be read)."
+            inputBinding: 
+              position: 8
+              separate: true
+              prefix: "-B"
+            type: 
+              - "null"
+              - "boolean"
+          - 
+            label: "List chromosome names"
+            id: "#list_chrs"
+            description: "List chromosome names."
+            inputBinding: 
+              position: 9
+              separate: true
+              prefix: "-l"
+            type: 
+              - "null"
+              - "boolean"
+          - 
+            label: "Reserve N MB of RAM."
+            id: "#mem_mb"
+            description: "Reserve N MB of RAM for tool execution."
+            type: 
+              - "null"
+              - "int"
+        adapters: []
+        requirements: 
+          - 
+            class: "DockerRequirement"
+            dockerPull: "images.sbgenomics.com/djordje_klisic/tabix:0.2.6"
+            dockerImageId: "78fc60e5f28a"
+          - 
+            class: "CPURequirement"
+            value: 1
+          - 
+            class: "MemRequirement"
+            value: 
+              script: "{\n  if ($job.inputs.mem_mb)\n  {\n    return $job.inputs.mem_mb\n  }\n  else\n  {\n    return 2048\n  }\n}"
+              engine: "#cwl-js-engine"
+              class: "Expression"
+          - 
+            requirements: 
+              - 
+                class: "DockerRequirement"
+                dockerPull: "rabix/js-engine"
+            id: "#cwl-js-engine"
+            class: "ExpressionEngineRequirement"
+            engineCommand: "cwl-engine.js"
+        outputs: 
+          - 
+            label: "Tabix indexed file"
+            outputBinding: 
+              glob: 
+                script: "$job.inputs.input_file.path"
+                engine: "#cwl-js-engine"
+                class: "Expression"
+              metadata: 
+                __inherit__: "input_file"
+              secondaryFiles: 
+                - ".tbi"
+            type: 
+              - "null"
+              - "File"
+            id: "#indexed_file"
+            description: "Tabix indexed file."
+          - 
+            label: "Tabix index"
+            outputBinding: 
+              glob: 
+                script: "{\n  filename = $job.inputs.input_file.path\n  path = filename.split('/').slice(0, -1).join('/')\n  return path + '/' + '*.tbi'\n  \n}"
+                engine: "#cwl-js-engine"
+                class: "Expression"
+              metadata: {}
+            type: 
+              - "null"
+              - "File"
+            id: "#index"
+            description: "Tabix index."
+      inputs: 
+        - 
+          id: "#tabix_index.type_format"
+          default: "vcf"
+        - 
+          id: "#tabix_index.skip_lines"
+        - 
+          id: "#tabix_index.end_chr"
+        - 
+          id: "#tabix_index.sequence_name_col"
+        - 
+          id: "#tabix_index.input_file"
+        - 
+          id: "#tabix_index.chr_start"
+        - 
+          id: "#tabix_index.comment_lines"
+        - 
+          id: "#tabix_index.zero_based"
+        - 
+          id: "#tabix_index.region_bed"
+        - 
+          id: "#tabix_index.list_chrs"
+        - 
+          id: "#tabix_index.mem_mb"
+          default: 4096
+      outputs: 
+        - 
+          id: "#tabix_index.indexed_file"
+        - 
+          id: "#tabix_index.index"
+  dataLinks: 
+    - 
+      source: "#tabix_index.index"
+      destination: "#muse_vcf_index"
+    - 
+      source: "#Muse.tumor_bai"
+      destination: "#broad_variant_pipeline.tumor_bai"
+    - 
+      source: "#remap_broad_tar.md5"
+      destination: "#md5"
+    - 
+      source: "#reference"
+      destination: "#Muse.reference"
+    - 
+      source: "#tabix_indexer.indexed_file"
+      destination: "#tabix_index.input_file"
+    - 
+      source: "#Muse.mutations"
+      destination: "#tabix_indexer.input_file"
+    - 
+      source: "#normal"
+      destination: "#broad_variant_pipeline.normal"
+    - 
+      source: "#input_tumor_bai"
+      destination: "#Muse.input_tumor_bai"
+    - 
+      source: "#input_normal_bai"
+      destination: "#Muse.input_normal_bai"
+    - 
+      source: "#broad_variant_pipeline.logs"
+      destination: "#logs"
+    - 
+      source: "#broad_variant_pipeline.stdout"
+      destination: "#stdout"
+    - 
+      source: "#tumor"
+      destination: "#remap_broad_tar.tumor_bam"
+    - 
+      source: "#tumor"
+      destination: "#broad_variant_pipeline.tumor"
+    - 
+      source: "#ref_tarball"
+      destination: "#broad_variant_pipeline.ref_tarball"
+    - 
+      source: "#broad_variant_pipeline.tbis"
+      destination: "#tbis"
+    - 
+      source: "#remap_broad_tar.output"
+      destination: "#broadlinks"
+    - 
+      source: "#tumor"
+      destination: "#Muse.tumor"
+    - 
+      source: "#broad_variant_pipeline.vcfs"
+      destination: "#vcfs"
+    - 
+      source: "#Muse.normal_bai"
+      destination: "#broad_variant_pipeline.normal_bai"
+    - 
+      source: "#normal"
+      destination: "#Muse.normal"
+    - 
+      source: "#tabix_index.indexed_file"
+      destination: "#muse_output"
+    - 
+      source: "#broad_variant_pipeline.broadlinks"
+      destination: "#remap_broad_tar.broad_input_tar"
+    - 
+      source: "#know"
+      destination: "#Muse.know"
+  inputs: 
+    - 
+      label: "tumor"
+      id: "#tumor"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "reference"
+      id: "#reference"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "normal"
+      id: "#normal"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "know"
+      id: "#know"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "ref_tarball"
+      id: "#ref_tarball"
+      type: 
+        - "File"
+    - 
+      label: "input_tumor_bai"
+      id: "#input_tumor_bai"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "input_normal_bai"
+      id: "#input_normal_bai"
+      type: 
+        - "null"
+        - "File"
+  outputs: 
+    - 
+      label: "vcfs"
+      id: "#vcfs"
+      source: 
+        - "#broad_variant_pipeline.vcfs"
+      type: 
+        - 
+          items: "File"
+          type: "array"
+    - 
+      label: "stdout"
+      id: "#stdout"
+      source: 
+        - "#broad_variant_pipeline.stdout"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "logs"
+      id: "#logs"
+      source: 
+        - "#broad_variant_pipeline.logs"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "md5"
+      id: "#md5"
+      source: 
+        - "#remap_broad_tar.md5"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "#broadlinks"
+      id: "#broadlinks"
+      source: 
+        - "#remap_broad_tar.output"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "tbis"
+      id: "#tbis"
+      source: 
+        - "#broad_variant_pipeline.tbis"
+      type: 
+        - "null"
+        - 
+          items: "File"
+          type: "array"
+    - 
+      label: "#muse_output"
+      id: "#muse_output"
+      source: 
+        - "#tabix_index.indexed_file"
+      type: 
+        - "null"
+        - "File"
+    - 
+      label: "#muse_vcf_index"
+      id: "#muse_vcf_index"
+      source: 
+        - "#tabix_index.index"
+      type: 
+        - "null"
+        - "File"
+  id: "ljuba/pcawg-2nd-round-154-multitumor-donors/muse-broad-r3-8xlarge-ebs20/0"
+  label: "muse-broad"
+
